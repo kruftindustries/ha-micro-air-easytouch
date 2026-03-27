@@ -1,9 +1,6 @@
 set_location:
   name: Set Location
   description: Sets the latitude and longitude for a MicroAir EasyTouch Thermostat.
-  target:
-    device:
-      integration: micro_air_easytouch
   fields:
     address:
       name: MAC Address
@@ -21,6 +18,7 @@ set_location:
         number:
           min: -90.0
           max: 90.0
+          step: 0.00001
           mode: box
     longitude:
       name: Longitude
@@ -31,4 +29,5 @@ set_location:
         number:
           min: -180.0
           max: 180.0
+          step: 0.00001
           mode: box

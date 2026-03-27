@@ -22,7 +22,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.components.bluetooth import async_ble_device_from_address
 
-from .const import DOMAIN
+from .const import DOMAIN, NUM_ZONES, ZONE_NAMES
 from .micro_air_easytouch.parser import MicroAirEasyTouchBluetoothDeviceData
 from .micro_air_easytouch.const import (
     UUIDS,
@@ -42,8 +42,12 @@ async def async_setup_entry(
 ) -> None:
     """Set up MicroAirEasyTouch climate platform."""
     data = hass.data[DOMAIN][config_entry.entry_id]["data"]
-    entity = MicroAirEasyTouchClimate(data, config_entry.unique_id)
-    async_add_entities([entity])
+    entities = []
+    for zone_num in range(NUM_ZONES):
+        zone_name = ZONE_NAMES.get(zone_num, f"Zone {zone_num + 1}")
+        entity = MicroAirEasyTouchClimate(data, config_entry.unique_id, zone_num, zone_name)
+        entities.append(entity)
+    async_add_entities(entities)
 
 class MicroAirEasyTouchClimate(ClimateEntity):
     """Representation of MicroAirEasyTouch Climate."""
@@ -98,12 +102,13 @@ class MicroAirEasyTouchClimate(ClimateEntity):
         "auto": [128],
     }
 
-    def __init__(self, data: MicroAirEasyTouchBluetoothDeviceData, mac_address: str) -> None:
+    def __init__(self, data: MicroAirEasyTouchBluetoothDeviceData, mac_address: str, zone_num: int = 0, zone_name: str = "Zone 1") -> None:
         """Initialize the climate."""
         self._data = data
         self._mac_address = mac_address
-        self._attr_unique_id = f"microaireasytouch_{mac_address}_climate"
-        self._attr_name = "EasyTouch Climate"
+        self._zone_num = zone_num
+        self._attr_unique_id = f"microaireasytouch_{mac_address}_climate_zone{zone_num}"
+        self._attr_name = f"EasyTouch {zone_name}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, f"MicroAirEasyTouch_{mac_address}")},
             name=f"EasyTouch {mac_address}",
@@ -137,12 +142,12 @@ class MicroAirEasyTouchClimate(ClimateEntity):
             self._state = {}
             return
 
-        message = {"Type": "Get Status", "Zone": 0, "EM": self._data._email, "TM": int(time.time())}
+        message = {"Type": "Get Status", "Zone": self._zone_num, "EM": self._data._email, "TM": int(time.time())}
         try:
             if await self._data.send_command(self.hass, ble_device, message):
                 json_payload = await self._data._read_gatt_with_retry(self.hass, UUIDS["jsonReturn"], ble_device)
                 if json_payload:
-                    self._state = self._data.decrypt(json_payload.decode('utf-8'))
+                    self._state = self._data.decrypt(json_payload.decode('utf-8'), zone=self._zone_num)
                     _LOGGER.debug("Initial state fetched: %s", self._state)
                     self.async_write_ha_state()
                 else:
@@ -251,7 +256,7 @@ class MicroAirEasyTouchClimate(ClimateEntity):
             _LOGGER.error("Could not find BLE device")
             return
 
-        changes = {"zone": 0, "power": 1}
+        changes = {"zone": self._zone_num, "power": 1}
         if ATTR_TEMPERATURE in kwargs:
             temp = int(kwargs[ATTR_TEMPERATURE])
             if self.hvac_mode == HVACMode.COOL:
@@ -280,7 +285,7 @@ class MicroAirEasyTouchClimate(ClimateEntity):
             message = {
                 "Type": "Change",
                 "Changes": {
-                    "zone": 0,
+                    "zone": self._zone_num,
                     "power": 0 if hvac_mode == HVACMode.OFF else 1,
                     "mode": mode,
                 },
@@ -304,7 +309,7 @@ class MicroAirEasyTouchClimate(ClimateEntity):
                 fan_value = 2
             else:
                 fan_value = 0
-            message = {"Type": "Change", "Changes": {"zone": 0, "fanOnly": fan_value}}
+            message = {"Type": "Change", "Changes": {"zone": self._zone_num, "fanOnly": fan_value}}
             await self._data.send_command(self.hass, ble_device, message)
         else:
             if fan_mode == "off":
@@ -317,7 +322,7 @@ class MicroAirEasyTouchClimate(ClimateEntity):
                 fan_value = 128  # full auto
             else:
                 fan_value = 128
-            changes = {"zone": 0}
+            changes = {"zone": self._zone_num}
             if self.hvac_mode == HVACMode.COOL:
                 changes["coolFan"] = fan_value
             elif self.hvac_mode == HVACMode.HEAT:
