@@ -6,13 +6,8 @@ import time
 import json
 
 # Bluetooth-related imports for device communication
-from bleak import BLEDevice
+from bleak import BLEDevice, BleakClient
 from bleak.exc import BleakError, BleakDBusError
-from bleak_retry_connector import (
-    BleakClientWithServiceCache,
-    establish_connection,
-    retry_bluetooth_connection_error,
-)
 
 from bluetooth_data_tools import short_address
 from bluetooth_sensor_state_data import BluetoothData
@@ -120,10 +115,10 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
         self.set_device_name(name)
         self.set_title(name)
 
-    def decrypt(self, data: bytes) -> dict:
-        """Parse and decode the device status data."""
+    def decrypt(self, data: bytes, zone: int = 0) -> dict:
+        """Parse and decode the device status data for the given zone."""
         status = json.loads(data)
-        info = status['Z_sts']['0']
+        info = status['Z_sts'][str(zone)]
         param = status['PRM']
         modes = {0: "off", 5: "heat_on", 4: "heat", 3: "cool_on", 2: "cool", 1: "fan", 11: "auto"}
         fan_modes_full = {0: "off", 1: "manualL", 2: "manualH", 65: "cycledL", 66: "cycledH", 128: "full auto"}
@@ -178,53 +173,53 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
 
         return hr_status
 
-    @retry_bluetooth_connection_error(attempts=7)
-    async def _connect_to_device(self, ble_device: BLEDevice):
-        """Connect to the device with retries."""
-        try:
-            self._client = await establish_connection(
-                BleakClientWithServiceCache,
-                ble_device,
-                ble_device.address,
-                timeout=20.0
-            )
-            if not self._client.services:
-                await asyncio.sleep(2)
-            if not self._client.services:
-                _LOGGER.error("No services available after connecting")
-                return False
-            return self._client
-        except Exception as e:
-            _LOGGER.error("Connection error: %s", str(e))
-            raise
+    async def _connect_to_device(self, ble_device: BLEDevice, retries: int = 3):
+        """Connect to the device using BleakClient directly."""
+        last_error = None
+        for attempt in range(retries):
+            try:
+                _LOGGER.debug("Connection attempt %d/%d to %s", attempt + 1, retries, ble_device.address)
+                client = BleakClient(ble_device, timeout=30.0)
+                await client.connect()
+                if not client.is_connected:
+                    raise BleakError("Connection reported success but client not connected")
+                if not client.services:
+                    await asyncio.sleep(2)
+                if not client.services:
+                    await client.disconnect()
+                    raise BleakError("No services available after connecting")
+                self._client = client
+                return self._client
+            except Exception as e:
+                last_error = e
+                _LOGGER.warning("Connection attempt %d/%d failed: %s", attempt + 1, retries, e)
+                if attempt < retries - 1:
+                    await asyncio.sleep(2)
+        _LOGGER.error("Connection failed after %d attempts: %s", retries, last_error)
+        return False
 
-    @retry_authentication(retries=3, delay=2)
+    @retry_authentication(retries=3, delay=3)
     async def authenticate(self, password: str) -> bool:
         """Authenticate with the device using the provided password."""
         try:
             if not self._client or not self._client.is_connected:
-                await asyncio.sleep(1)
-                if not self._client or not self._client.is_connected:
-                    await self._connect_to_device(self._ble_device)
-                    await asyncio.sleep(0.5)
-                if not self._client or not self._client.is_connected:
-                    _LOGGER.error("Client not connected after reconnecting")
-                    return False
+                _LOGGER.warning("Client not connected, cannot authenticate")
+                return False
             if not self._client.services:
                 await self._client.discover_services()
                 await asyncio.sleep(1)
                 if not self._client.services:
                     _LOGGER.error("Services not discovered")
                     return False
+            # Delay before password write — device needs time after connection
+            await asyncio.sleep(2)
             password_bytes = password.encode('utf-8')
             await self._client.write_gatt_char(UUIDS["passwordCmd"], password_bytes, response=True)
             _LOGGER.debug("Authentication sent successfully")
             return True
         except Exception as e:
-            _LOGGER.error("Authentication failed: %s", str(e))
-            if self._client and self._client.is_connected:
-                await self._client.disconnect()
-            self._client = None
+            _LOGGER.warning("Authentication attempt failed: %s", str(e))
+            # Don't disconnect — keep connection alive for retry
             return False
 
     async def _write_gatt_with_retry(self, hass, uuid: str, data: bytes, ble_device: BLEDevice, retries: int = 3) -> bool:
@@ -338,7 +333,7 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
             self._ble_device = None
 
     async def send_command(self, hass, ble_device: BLEDevice, command: dict) -> bool:
-        """Send command to device."""
+        """Send command to device (connects, sends, disconnects)."""
         try:
             if not self._client or not self._client.is_connected:
                 self._client = await self._connect_to_device(ble_device)
@@ -351,6 +346,44 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
         except Exception as e:
             _LOGGER.error("Error sending command: %s", str(e))
             return False
+        finally:
+            try:
+                if self._client and self._client.is_connected:
+                    await self._client.disconnect()
+            except Exception as e:
+                _LOGGER.debug("Error disconnecting: %s", str(e))
+            self._client = None
+
+    async def fetch_status(self, hass, ble_device: BLEDevice, command: dict) -> bytes | None:
+        """Send a status command and read the response in a single connection."""
+        try:
+            self._client = await self._connect_to_device(ble_device)
+            if not self._client or not self._client.is_connected:
+                _LOGGER.error("Failed to connect for status fetch")
+                return None
+            if not await self.authenticate(self._password):
+                _LOGGER.error("Failed to authenticate for status fetch")
+                return None
+
+            # Send the status request
+            command_bytes = json.dumps(command).encode()
+            write_delay = self._get_operation_delay(hass, ble_device.address, 'write')
+            if write_delay > 0:
+                await asyncio.sleep(write_delay)
+            await self._client.write_gatt_char(UUIDS["jsonCmd"], command_bytes, response=True)
+            self._adjust_operation_delay(hass, ble_device.address, 'write')
+
+            # Read the response on the same connection
+            await asyncio.sleep(1)
+            read_delay = self._get_operation_delay(hass, ble_device.address, 'read')
+            if read_delay > 0:
+                await asyncio.sleep(read_delay)
+            result = await self._client.read_gatt_char(UUIDS["jsonReturn"])
+            self._adjust_operation_delay(hass, ble_device.address, 'read')
+            return result
+        except Exception as e:
+            _LOGGER.error("Error fetching status: %s", str(e))
+            return None
         finally:
             try:
                 if self._client and self._client.is_connected:

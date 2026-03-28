@@ -10,6 +10,15 @@
       },
       "bluetooth_confirm": {
         "description": "[%key:component::bluetooth::config::step::bluetooth_confirm::description%]"
+      },
+      "manual": {
+        "description": "No EasyTouch devices were discovered via Bluetooth. Select a device or enter the address manually.",
+        "data": {
+          "address": "BLE MAC Address",
+          "username": "Email",
+          "password": "Password",
+          "rescan": "Rescan for devices"
+        }
       }
     },
     "abort": {

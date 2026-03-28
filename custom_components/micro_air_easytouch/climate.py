@@ -1,6 +1,7 @@
 """Support for MicroAirEasyTouch climate control."""
 from __future__ import annotations
 
+from datetime import timedelta
 import logging
 import json
 import time
@@ -20,9 +21,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.components.bluetooth import async_ble_device_from_address
-
 from .const import DOMAIN, NUM_ZONES, ZONE_NAMES
+from .device import get_ble_device
 from .micro_air_easytouch.parser import MicroAirEasyTouchBluetoothDeviceData
 from .micro_air_easytouch.const import (
     UUIDS,
@@ -35,17 +35,20 @@ from .micro_air_easytouch.const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+SCAN_INTERVAL = timedelta(minutes=5)
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up MicroAirEasyTouch climate platform."""
-    data = hass.data[DOMAIN][config_entry.entry_id]["data"]
+    entry_data = hass.data[DOMAIN][config_entry.entry_id]
+    data = entry_data["data"]
     entities = []
     for zone_num in range(NUM_ZONES):
         zone_name = ZONE_NAMES.get(zone_num, f"Zone {zone_num + 1}")
-        entity = MicroAirEasyTouchClimate(data, config_entry.unique_id, zone_num, zone_name)
+        entity = MicroAirEasyTouchClimate(data, config_entry, zone_num, zone_name)
         entities.append(entity)
     async_add_entities(entities)
 
@@ -102,16 +105,17 @@ class MicroAirEasyTouchClimate(ClimateEntity):
         "auto": [128],
     }
 
-    def __init__(self, data: MicroAirEasyTouchBluetoothDeviceData, mac_address: str, zone_num: int = 0, zone_name: str = "Zone 1") -> None:
+    def __init__(self, data: MicroAirEasyTouchBluetoothDeviceData, config_entry: ConfigEntry, zone_num: int = 0, zone_name: str = "Zone 1") -> None:
         """Initialize the climate."""
         self._data = data
-        self._mac_address = mac_address
+        self._config_entry = config_entry
+        self._mac_address = config_entry.unique_id
         self._zone_num = zone_num
-        self._attr_unique_id = f"microaireasytouch_{mac_address}_climate_zone{zone_num}"
+        self._attr_unique_id = f"microaireasytouch_{self._mac_address}_climate_zone{zone_num}"
         self._attr_name = f"EasyTouch {zone_name}"
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"MicroAirEasyTouch_{mac_address}")},
-            name=f"EasyTouch {mac_address}",
+            identifiers={(DOMAIN, f"MicroAirEasyTouch_{self._mac_address}")},
+            name=f"EasyTouch {self._mac_address}",
             manufacturer="Micro-Air",
             model="Thermostat",
         )
@@ -134,30 +138,52 @@ class MicroAirEasyTouchClimate(ClimateEntity):
         """Return the icon to use for the current fan mode."""
         return self._FAN_MODE_ICONS.get(self.fan_mode, "mdi:fan")
 
-    async def _async_fetch_initial_state(self) -> None:
-        """Fetch the initial state from the device."""
-        ble_device = async_ble_device_from_address(self.hass, self._mac_address)
-        if not ble_device:
-            _LOGGER.error("Could not find BLE device: %s", self._mac_address)
-            self._state = {}
-            return
+    def _get_entry_data(self) -> dict:
+        """Get the shared entry data dict."""
+        return self.hass.data[DOMAIN][self._config_entry.entry_id]
 
-        message = {"Type": "Get Status", "Zone": self._zone_num, "EM": self._data._email, "TM": int(time.time())}
-        try:
-            if await self._data.send_command(self.hass, ble_device, message):
-                json_payload = await self._data._read_gatt_with_retry(self.hass, UUIDS["jsonReturn"], ble_device)
-                if json_payload:
-                    self._state = self._data.decrypt(json_payload.decode('utf-8'), zone=self._zone_num)
-                    _LOGGER.debug("Initial state fetched: %s", self._state)
-                    self.async_write_ha_state()
-                else:
-                    self._state = {}
-                    _LOGGER.warning("No payload received for initial state")
-            else:
+    async def _async_fetch_raw_status(self) -> bytes | None:
+        """Fetch raw status from device, using shared lock and cache."""
+        entry_data = self._get_entry_data()
+        lock = entry_data["lock"]
+
+        async with lock:
+            # If another zone just fetched, reuse the cached response
+            from . import STATUS_CACHE_TTL
+            now = time.monotonic()
+            if entry_data["cached_raw"] and (now - entry_data["cached_time"]) < STATUS_CACHE_TTL:
+                _LOGGER.debug("Using cached status (age=%.1fs)", now - entry_data["cached_time"])
+                return entry_data["cached_raw"]
+
+            # Fetch fresh status
+            ble_device = get_ble_device(self.hass, self._mac_address)
+            if not ble_device:
+                _LOGGER.error("Could not find BLE device: %s", self._mac_address)
+                return None
+
+            message = {"Type": "Get Status", "Zone": 0, "EM": self._data._email, "TM": int(time.time())}
+            try:
+                raw = await self._data.fetch_status(self.hass, ble_device, message)
+                if raw:
+                    entry_data["cached_raw"] = raw
+                    entry_data["cached_time"] = time.monotonic()
+                    return raw
+                _LOGGER.warning("No payload received for status")
+            except Exception as e:
+                _LOGGER.error("Failed to fetch status: %s", str(e))
+            return None
+
+    async def _async_fetch_state(self) -> None:
+        """Fetch and parse state for this zone."""
+        raw = await self._async_fetch_raw_status()
+        if raw:
+            try:
+                self._state = self._data.decrypt(raw.decode("utf-8"), zone=self._zone_num)
+                _LOGGER.debug("Zone %d state: %s", self._zone_num, self._state)
+            except (KeyError, IndexError) as e:
+                _LOGGER.error("Failed to parse zone %d from response: %s", self._zone_num, e)
                 self._state = {}
-                _LOGGER.warning("Failed to send command for initial state")
-        except Exception as e:
-            _LOGGER.error("Failed to fetch initial state: %s", str(e))
+        else:
             self._state = {}
 
     @property
@@ -251,7 +277,7 @@ class MicroAirEasyTouchClimate(ClimateEntity):
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperature."""
-        ble_device = async_ble_device_from_address(self.hass, self._mac_address)
+        ble_device = get_ble_device(self.hass, self._mac_address)
         if not ble_device:
             _LOGGER.error("Could not find BLE device")
             return
@@ -275,7 +301,7 @@ class MicroAirEasyTouchClimate(ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
-        ble_device = async_ble_device_from_address(self.hass, self._mac_address)
+        ble_device = get_ble_device(self.hass, self._mac_address)
         if not ble_device:
             _LOGGER.error("Could not find BLE device")
             return
@@ -294,7 +320,7 @@ class MicroAirEasyTouchClimate(ClimateEntity):
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set new target fan mode using standard Home Assistant names."""
-        ble_device = async_ble_device_from_address(self.hass, self._mac_address)
+        ble_device = get_ble_device(self.hass, self._mac_address)
         if not ble_device:
             _LOGGER.error("Could not find BLE device")
             return
@@ -333,5 +359,5 @@ class MicroAirEasyTouchClimate(ClimateEntity):
             await self._data.send_command(self.hass, ble_device, message)
 
     async def async_update(self) -> None:
-        """Update the entity state manually if needed."""
-        await self._async_fetch_initial_state()
+        """Update the entity state."""
+        await self._async_fetch_state()

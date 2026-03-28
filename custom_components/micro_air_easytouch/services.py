@@ -5,11 +5,11 @@ import logging
 import time
 import voluptuous as vol
 
-from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.core import HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
 
 from .const import DOMAIN
+from .device import get_ble_device
 from .micro_air_easytouch.parser import MicroAirEasyTouchBluetoothDeviceData
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
         assert mac_address is not None
 
         # Get BLE device
-        ble_device = async_ble_device_from_address(hass, mac_address)
+        ble_device = get_ble_device(hass, mac_address)
         if not ble_device:
             _LOGGER.error("Could not find BLE device for address %s", mac_address)
             return

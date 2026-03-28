@@ -8,10 +8,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.components.bluetooth import async_ble_device_from_address
-
 from .const import DOMAIN
-from .micro_air_easytouch.parser import MicroAirEasyTouchBluetoothDeviceData  # Corrected import
+from .device import get_ble_device
+from .micro_air_easytouch.parser import MicroAirEasyTouchBluetoothDeviceData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ class MicroAirEasyTouchRebootButton(ButtonEntity):
     async def async_press(self) -> None:
         """Handle the button press."""
         _LOGGER.debug("Reboot button pressed")
-        ble_device = async_ble_device_from_address(self.hass, self._mac_address)
+        ble_device = get_ble_device(self.hass, self._mac_address)
         if not ble_device:
             _LOGGER.error("Could not find BLE device for reboot: %s", self._mac_address)
             return

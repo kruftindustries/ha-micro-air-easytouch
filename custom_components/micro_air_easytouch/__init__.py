@@ -1,7 +1,9 @@
 """MicroAirEasyTouch Integration"""
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Final
 
 from homeassistant.components.bluetooth import (
@@ -19,6 +21,9 @@ from .services import async_register_services, async_unregister_services
 PLATFORMS: Final = [Platform.BUTTON, Platform.CLIMATE]
 _LOGGER = logging.getLogger(__name__)
 
+# How long a cached status response is considered fresh (seconds)
+STATUS_CACHE_TTL = 30
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up MicroAirEasyTouch from a config entry."""
     address = entry.unique_id
@@ -27,7 +32,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     email = entry.data.get(CONF_USERNAME)
     data = MicroAirEasyTouchBluetoothDeviceData(password=password, email=email)
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"data": data}
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "data": data,
+        "lock": asyncio.Lock(),
+        "cached_raw": None,
+        "cached_time": 0.0,
+    }
 
     @callback
     def _handle_bluetooth_update(service_info: BluetoothServiceInfoBleak) -> None:
